@@ -3,7 +3,6 @@
 A complete guide to building a production-grade data cleaning pipeline. You'll understand every component and why it exists.
 
 ---
-## Read the Setup Guide for further information on setup for the project 
 
 ## Table of Contents
 
@@ -2760,4 +2759,1147 @@ This is a real system you could put into production. Every component serves a pu
 5. **Monitor**: Watch the GUI dashboard update in real-time
 6. **Customize**: Add your own Kafka source, database sink, or cleaning rules
 
-Good luck! 
+Good luck! 🚀
+
+---
+
+## Part 11: Troubleshooting Common Issues
+
+### Problem: "Connection refused" (Kafka or PostgreSQL)
+
+**Symptoms:**
+```
+org.apache.kafka.common.errors.TimeoutException: Timed out during connection
+```
+
+**Causes:**
+- Kafka/PostgreSQL not running
+- Wrong hostname/port
+- Firewall blocking connection
+
+**Solutions:**
+
+Check if services are running:
+```bash
+# Kafka
+nc -zv localhost 9092
+
+# PostgreSQL  
+psql -U postgres -d postgres -c "SELECT 1;"
+
+# If using Docker
+docker-compose ps
+docker-compose logs kafka
+docker-compose logs postgres
+```
+
+Fix config.yaml:
+```yaml
+kafka:
+  brokers: "localhost:9092"  # Not 127.0.0.1 or wrong port
+
+database:
+  url: "jdbc:postgresql://localhost:5432/data_cleaner"  # Exact URL
+```
+
+If using Docker Compose:
+```yaml
+kafka:
+  brokers: "kafka:29092"  # Not localhost; use service name
+
+database:
+  url: "jdbc:postgresql://postgres:5432/data_cleaner"  # Service name
+```
+
+### Problem: "No such table: cleaned_records"
+
+**Symptoms:**
+```
+ERROR: relation "cleaned_records" does not exist
+```
+
+**Cause:** Database schema wasn't initialized.
+
+**Solution:** Ensure PostgreSQL extension exists:
+```bash
+psql -U postgres -d data_cleaner -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+```
+
+Delete and recreate the database:
+```bash
+dropdb data_cleaner
+createdb data_cleaner
+psql -U postgres -d data_cleaner -c "CREATE EXTENSION pgcrypto;"
+
+# Then restart the app (schema initializes on first run)
+```
+
+### Problem: "OutOfMemoryError: Java heap space"
+
+**Symptoms:**
+```
+java.lang.OutOfMemoryError: Java heap space
+```
+
+**Causes:**
+- Dedup cache growing too large
+- Too many connections in pool
+- Queue accumulating records
+
+**Solutions:**
+
+Increase heap size:
+```bash
+java -Xms1g -Xmx4g -jar target/data-cleaner-1.0.0.jar config.yaml
+```
+
+Or in docker-compose.yml:
+```yaml
+environment:
+  JAVA_OPTS: "-Xms1g -Xmx4g"
+```
+
+Reduce concurrent workers:
+```yaml
+cleaning:
+  concurrent_workers: 4  # Was 8
+```
+
+Reduce batch size:
+```yaml
+kafka:
+  batch_size: 500  # Was 1000
+```
+
+Clear dedup cache periodically (or switch to Bloom filter for large datasets).
+
+### Problem: "HikariPool - Connection is not available"
+
+**Symptoms:**
+```
+org.postgresql.util.PSQLException: 
+Connection pool exhausted; queue timeout reached
+```
+
+**Cause:** All database connections are in use; workers not finishing quickly enough.
+
+**Solutions:**
+
+Increase pool size:
+```yaml
+database:
+  pool_size: 50  # Was 20
+```
+
+Check for slow queries:
+```bash
+psql -U postgres -d data_cleaner -c \
+  "SELECT query, mean_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 5;"
+```
+
+Add indexes if missing:
+```bash
+psql -U postgres -d data_cleaner -c \
+  "CREATE INDEX IF NOT EXISTS idx_cleaned_status ON cleaned_records(status);"
+```
+
+### Problem: "Duplicate hash collisions" (false positives on dedup)
+
+**Symptoms:** Legitimate different records marked as duplicates.
+
+**Likelihood:** ~1 in 2^32 (extremely rare)
+
+**Solutions:**
+
+If happening, switch to better hash (future enhancement):
+```java
+// Current: XOR (32-bit)
+// Better: MurmurHash3 (128-bit)
+```
+
+Or use Bloom filter for probabilistic dedup:
+```java
+BloomFilter<CharSequence> filter = BloomFilter.create(
+    Funnels.stringFunnel(Charsets.UTF_8),
+    100000,
+    0.01  // 1% false positive rate
+);
+```
+
+---
+
+## Part 12: Performance Tuning
+
+### Baseline Measurements
+
+Before tuning, measure current performance:
+
+```bash
+# Start app with verbose logging
+java -jar target/data-cleaner-1.0.0.jar config.yaml 2>&1 | tee app.log
+
+# In another terminal, generate load
+java -cp target/data-cleaner-1.0.0.jar \
+  com.daetl.cleaner.test.SampleDataProducer localhost:9092 raw_data 10000
+
+# Monitor
+watch "psql -U postgres -d data_cleaner -c \
+  \"SELECT COUNT(*) FROM cleaned_records;\""
+```
+
+Measure:
+- **Time to process 10k records**: `grep "Batch.*completed" app.log`
+- **Throughput**: Records / time
+- **CPU usage**: `top` or `docker stats`
+- **Memory**: `jps -m` or `docker stats`
+
+### Tuning Strategy
+
+```
+Bottleneck → Cause → Fix
+
+Slow Cleaning → Null removal or dedup → More workers
+Slow Database → Network/I/O → Batch size, pool size
+High Memory → Dedup cache or queue → Reduce, or use Bloom filter
+High CPU → Hashing or streams → Optimize hash function
+```
+
+### Common Tuning Knobs
+
+#### For High Throughput (10k+ rec/sec)
+
+```yaml
+cleaning:
+  concurrent_workers: 16      # More parallelism (was 8)
+  batch_size: 5000            # Bigger batches (was 1000)
+
+database:
+  pool_size: 50               # More connections (was 20)
+
+kafka:
+  batch_size: 5000            # Fetch more per poll (was 1000)
+```
+
+Trade-off: Higher latency (batches take longer to accumulate).
+
+#### For Low Latency (<200ms)
+
+```yaml
+cleaning:
+  concurrent_workers: 4       # Fewer, faster startup (was 8)
+  batch_size: 100             # Small batches (was 1000)
+
+database:
+  pool_size: 10               # Enough connections (was 20)
+
+kafka:
+  batch_size: 100             # Poll frequently (was 1000)
+```
+
+Trade-off: Lower throughput (one-by-one processing is slow).
+
+#### For Small Memory Footprint
+
+```yaml
+cleaning:
+  concurrent_workers: 2       # Fewer threads (was 8)
+
+database:
+  pool_size: 5                # Fewer connections (was 20)
+
+# Queue capacity (in code)
+BlockingQueue<List<DataRecord>> processingQueue = 
+    new LinkedBlockingQueue<>(10);  // Was 100
+```
+
+#### For Cost Optimization (cloud)
+
+```yaml
+cleaning:
+  concurrent_workers: 8
+  batch_size: 5000            # Fewer, bigger batches = fewer machines
+
+database:
+  pool_size: 30
+
+# Run 3 instances vs 1 instance with 24 workers
+```
+
+### Profiling
+
+#### CPU Profiling
+
+Which part is slow?
+
+```bash
+# Run with profiler
+java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005 \
+  -jar target/data-cleaner-1.0.0.jar config.yaml
+```
+
+Or use async-profiler:
+```bash
+# Download: https://github.com/async-profiler/async-profiler
+./async-profiler.sh start jps  # Get Java PID
+./async-profiler.sh stop jps -o flamegraph
+# View flamegraph.html
+```
+
+#### Memory Profiling
+
+What's using memory?
+
+```bash
+# Enable GC logging
+java -Xms1g -Xmx4g \
+  -XX:+PrintGCDetails \
+  -XX:+PrintGCTimeStamps \
+  -Xloggc:gc.log \
+  -jar target/data-cleaner-1.0.0.jar config.yaml
+
+# Analyze
+cat gc.log | grep "Pause Young"  # Frequency and duration of GC
+```
+
+#### Throughput Benchmarking
+
+```bash
+# Generate 100k records, time it
+time java -cp target/data-cleaner-1.0.0.jar \
+  com.daetl.cleaner.test.SampleDataProducer localhost:9092 raw_data 100000
+
+# Check how many stored in DB
+psql -U postgres -d data_cleaner -c \
+  "SELECT COUNT(*) FROM cleaned_records;"
+```
+
+Calculate:
+```
+Throughput = Records / Time (seconds)
+```
+
+Example:
+- Time: 10 seconds
+- Records: 100,000
+- **Throughput: 10,000 records/sec**
+
+### JVM Tuning
+
+#### GC Tuning
+
+G1GC (good for mixed workloads):
+```bash
+java -XX:+UseG1GC \
+  -XX:MaxGCPauseMillis=200 \
+  -jar target/data-cleaner-1.0.0.jar config.yaml
+```
+
+ZGC (low-latency, requires Java 21):
+```bash
+java -XX:+UseZGC \
+  -XX:ZUncommitDelay=300 \
+  -jar target/data-cleaner-1.0.0.jar config.yaml
+```
+
+#### Thread Tuning
+
+Threads cost memory (~1MB each). Don't create more than CPU cores:
+
+```bash
+# Check CPU cores
+grep -c ^processor /proc/cpuinfo
+
+# If 8 cores, use:
+concurrent_workers: 8
+```
+
+### Database Tuning
+
+#### PostgreSQL Configuration
+
+Edit `/etc/postgresql/15/main/postgresql.conf`:
+
+```ini
+# Larger shared buffers for caching
+shared_buffers = 256MB
+
+# More work memory per operation
+work_mem = 20MB
+
+# Parallel operations
+max_parallel_workers_per_gather = 4
+```
+
+Restart PostgreSQL:
+```bash
+sudo systemctl restart postgresql
+```
+
+#### Batch Insert Optimization
+
+Current: 1000 records per INSERT
+
+Try larger:
+```java
+if (batch.size() >= 5000) {  // Was 1000
+    queue.put(batch);
+}
+```
+
+Or prepare batch insert differently:
+```java
+// Instead of addBatch() per record
+StringBuilder sql = new StringBuilder("INSERT INTO cleaned_records (...) VALUES");
+for (int i = 0; i < records.size(); i++) {
+    if (i > 0) sql.append(",");
+    sql.append("(?, ?, ?, ?, ?)");
+}
+sql.append(" ON CONFLICT DO UPDATE SET updated_at = CURRENT_TIMESTAMP");
+```
+
+---
+
+## Part 13: Extending the System
+
+### Add Custom Cleaning Rules
+
+Example: Uppercase all names, trim whitespace
+
+Create `src/main/java/com/daetl/cleaner/engine/CustomCleaner.java`:
+
+```java
+package com.daetl.cleaner.engine;
+
+import java.util.*;
+
+/**
+ * Custom cleaning rules beyond null removal and dedup.
+ */
+public class CustomCleaner {
+    
+    /**
+     * Apply all custom rules to a record.
+     */
+    public static Map<String, Object> applyCustomRules(Map<String, Object> fields) {
+        Map<String, Object> cleaned = new HashMap<>(fields);
+        
+        // Rule 1: Uppercase names
+        if (cleaned.containsKey("name")) {
+            String name = (String) cleaned.get("name");
+            if (name != null) {
+                cleaned.put("name", name.toUpperCase());
+            }
+        }
+        
+        // Rule 2: Trim all strings
+        cleaned.replaceAll((key, value) -> {
+            if (value instanceof String) {
+                return ((String) value).trim();
+            }
+            return value;
+        });
+        
+        // Rule 3: Normalize email (lowercase)
+        if (cleaned.containsKey("email")) {
+            String email = (String) cleaned.get("email");
+            if (email != null) {
+                cleaned.put("email", email.toLowerCase());
+            }
+        }
+        
+        // Rule 4: Validate age range
+        if (cleaned.containsKey("age")) {
+            Integer age = (Integer) cleaned.get("age");
+            if (age != null && (age < 0 || age > 150)) {
+                cleaned.remove("age");  // Invalid age
+            }
+        }
+        
+        return cleaned;
+    }
+}
+```
+
+Integrate into cleaning engine:
+
+```java
+// In DataCleaningEngine.cleanRecord()
+Map<String, Object> cleanedFields = removeNullValues(record.getFields());
+cleanedFields = CustomCleaner.applyCustomRules(cleanedFields);  // Add this line
+```
+
+### Add Regex Validation
+
+```java
+public class RegexCleaner {
+    private static final String EMAIL_REGEX = "^[A-Za-z0-9+_.-]+@(.+)$";
+    private static final String PHONE_REGEX = "^\\+?[1-9]\\d{1,14}$";
+    
+    public static boolean isValidEmail(String email) {
+        return email != null && email.matches(EMAIL_REGEX);
+    }
+    
+    public static boolean isValidPhone(String phone) {
+        return phone != null && phone.matches(PHONE_REGEX);
+    }
+    
+    public static Map<String, Object> validateAndClean(Map<String, Object> fields) {
+        Map<String, Object> cleaned = new HashMap<>(fields);
+        
+        // Remove invalid emails
+        if (cleaned.containsKey("email")) {
+            String email = (String) cleaned.get("email");
+            if (!isValidEmail(email)) {
+                cleaned.remove("email");
+            }
+        }
+        
+        // Remove invalid phones
+        if (cleaned.containsKey("phone")) {
+            String phone = (String) cleaned.get("phone");
+            if (!isValidPhone(phone)) {
+                cleaned.remove("phone");
+            }
+        }
+        
+        return cleaned;
+    }
+}
+```
+
+### Add Schema Validation (Avro)
+
+For structured data, use Avro schema:
+
+```java
+// src/main/resources/user-schema.avsc
+{
+  "type": "record",
+  "name": "User",
+  "fields": [
+    {"name": "id", "type": "string"},
+    {"name": "name", "type": "string"},
+    {"name": "email", "type": ["null", "string"], "default": null},
+    {"name": "age", "type": ["null", "int"], "default": null}
+  ]
+}
+```
+
+Validate records:
+```java
+import org.apache.avro.Schema;
+import org.apache.avro.SchemaBuilder;
+
+public class SchemaValidator {
+    private final Schema schema;
+    
+    public SchemaValidator(String schemaPath) throws Exception {
+        this.schema = new Schema.Parser().parse(
+            new File(schemaPath)
+        );
+    }
+    
+    public boolean isValid(Map<String, Object> record) {
+        // Validate against schema
+        // Returns true if matches schema
+        return true;  // Simplified
+    }
+}
+```
+
+---
+
+## Part 14: Production Deployment
+
+### Pre-Deployment Checklist
+
+Before going live:
+
+- [ ] Test with production data volume (10M+ records)
+- [ ] Run for 24+ hours, check for memory leaks
+- [ ] Configure database backups
+- [ ] Set up monitoring/alerting
+- [ ] Document runbooks for common issues
+- [ ] Test graceful shutdown
+- [ ] Load test (ramp up from 0 → peak load)
+- [ ] Verify TLS certificates (if enabled)
+- [ ] Set resource limits (CPU, memory)
+
+### Kubernetes Deployment
+
+Scale to multiple instances:
+
+Create `k8s-deployment.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-cleaner
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: data-cleaner
+  template:
+    metadata:
+      labels:
+        app: data-cleaner
+    spec:
+      containers:
+      - name: cleaner
+        image: data-cleaner:1.0
+        env:
+        - name: KAFKA_BROKERS
+          value: "kafka-cluster:9092"
+        - name: DB_URL
+          value: "jdbc:postgresql://postgres-service:5432/data_cleaner"
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: password
+        - name: JAVA_OPTS
+          value: "-Xms512m -Xmx2g"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-cleaner-service
+spec:
+  selector:
+    app: data-cleaner
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+```
+
+Deploy:
+```bash
+kubectl apply -f k8s-deployment.yaml
+
+# Check status
+kubectl get pods -l app=data-cleaner
+
+# View logs
+kubectl logs -l app=data-cleaner -f
+```
+
+### Monitoring (Prometheus)
+
+Add Prometheus metrics export:
+
+```java
+// In DataCleanerApp
+import io.micrometer.prometheus.PrometheusMeterRegistry;
+import io.micrometer.prometheus.PrometheusConfig;
+
+public class MetricsExporter {
+    private final PrometheusMeterRegistry registry;
+    
+    public MetricsExporter() {
+        this.registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+    }
+    
+    public void registerMetrics(DataCleaningEngine engine) {
+        registry.gauge("cleaner.records.processed", () -> engine.getRecordsProcessed());
+        registry.gauge("cleaner.records.cleaned", () -> engine.getRecordsCleaned());
+        registry.gauge("cleaner.records.skipped", () -> engine.getRecordsSkipped());
+    }
+    
+    public String scrape() {
+        return registry.scrape();
+    }
+}
+```
+
+Expose `/metrics` endpoint:
+```java
+// Add simple HTTP server
+com.sun.net.httpserver.HttpServer server = 
+    com.sun.net.httpserver.HttpServer.create(
+        new java.net.InetSocketAddress(8080), 0
+    );
+server.createContext("/metrics", exchange -> {
+    String response = metricsExporter.scrape();
+    exchange.getResponseHeaders().set("Content-Type", "text/plain");
+    exchange.sendResponseHeaders(200, response.getBytes().length);
+    exchange.getResponseBody().write(response.getBytes());
+    exchange.close();
+});
+server.start();
+```
+
+### Alerting Rules (Prometheus)
+
+Create `prometheus-rules.yaml`:
+
+```yaml
+groups:
+- name: cleaner
+  rules:
+  - alert: CleanerStalled
+    expr: rate(cleaner_records_processed[5m]) == 0
+    for: 5m
+    annotations:
+      summary: "Data cleaner has stopped processing"
+  
+  - alert: HighDuplicateRate
+    expr: cleaner_records_skipped / cleaner_records_processed > 0.2
+    for: 5m
+    annotations:
+      summary: "Duplicate rate above 20%"
+  
+  - alert: DatabaseConnectionPoolExhausted
+    expr: hikari_connections_active == hikari_connections_max
+    for: 1m
+    annotations:
+      summary: "Database connection pool at capacity"
+```
+
+---
+
+## Part 15: Common Pitfalls & Best Practices
+
+### Pitfall 1: Shared Mutable State
+
+**Bad:**
+```java
+// Don't do this in concurrent code!
+Map<String, Integer> stats = new HashMap<>();
+stats.put("processed", 0);
+
+executorService.submit(() -> {
+    stats.put("processed", stats.get("processed") + 1);  // Race condition!
+});
+```
+
+**Good:**
+```java
+AtomicLong processed = new AtomicLong(0);
+
+executorService.submit(() -> {
+    processed.incrementAndGet();  // Thread-safe
+});
+```
+
+**Lesson:** Use atomic types or synchronization for shared mutable state.
+
+### Pitfall 2: Blocking Operations
+
+**Bad:**
+```java
+// Blocking call in critical path!
+kafkaConsumer.poll(Duration.ofSeconds(30));  // Waits 30s
+```
+
+**Good:**
+```java
+// Non-blocking poll with timeout
+kafkaConsumer.poll(Duration.ofMillis(1000));  // 1s timeout
+```
+
+**Lesson:** Don't block threads; use timeouts or async patterns.
+
+### Pitfall 3: Resource Leaks
+
+**Bad:**
+```java
+public void processData() {
+    Connection conn = dataSource.getConnection();
+    // Do work
+    // Oops, forgot conn.close()!
+}
+```
+
+**Good:**
+```java
+try (Connection conn = dataSource.getConnection()) {
+    // Do work
+}  // Auto-closes
+```
+
+**Lesson:** Always use try-with-resources for cleanup.
+
+### Pitfall 4: Configuration Hardcoded
+
+**Bad:**
+```java
+String brokers = "localhost:9092";  // Won't work in production!
+```
+
+**Good:**
+```java
+String brokers = System.getenv("KAFKA_BROKERS");
+if (brokers == null) brokers = "localhost:9092";  // Fallback
+```
+
+**Lesson:** Always externalize configuration (YAML, env vars, properties files).
+
+### Pitfall 5: Ignoring Exceptions
+
+**Bad:**
+```java
+try {
+    processRecord(record);
+} catch (Exception e) {
+    // Silently swallow exception!
+}
+```
+
+**Good:**
+```java
+try {
+    processRecord(record);
+} catch (Exception e) {
+    logger.warn("Failed to process record: {}", record.getId(), e);
+    metrics.recordFailure();
+    // Continue processing other records
+}
+```
+
+**Lesson:** Log errors, track failures, continue gracefully.
+
+### Pitfall 6: Premature Optimization
+
+**Bad:**
+```java
+// Over-complex optimization before profiling!
+// Custom thread pool, lock-free structures, etc.
+```
+
+**Good:**
+```java
+// 1. Make it work
+// 2. Measure (profile, benchmark)
+// 3. Optimize bottleneck
+```
+
+**Lesson:** Profile first; optimize what matters.
+
+### Best Practice 1: Health Checks
+
+Expose health status:
+
+```java
+public HealthStatus getHealth() {
+    try {
+        persistence.getStatistics();  // DB check
+        return new HealthStatus("HEALTHY", "All systems operational");
+    } catch (Exception e) {
+        return new HealthStatus("UNHEALTHY", e.getMessage());
+    }
+}
+```
+
+Used for Kubernetes probes.
+
+### Best Practice 2: Structured Logging
+
+**Bad:**
+```java
+logger.info("Processed records: " + processed);
+```
+
+**Good:**
+```java
+logger.info("Batch processing complete", 
+    "batch_id", batchId, 
+    "records_processed", processed,
+    "processing_time_ms", elapsed);
+```
+
+Enables structured log analysis (ELK, Datadog, etc.).
+
+### Best Practice 3: Graceful Degradation
+
+**Bad:**
+```java
+if (database_slow) {
+    throw new Exception("DB is slow!");
+}
+```
+
+**Good:**
+```java
+if (database_slow) {
+    logger.warn("Database slow; buffering records locally");
+    // Continue processing, store to local queue
+    // Flush when DB recovers
+}
+```
+
+**Lesson:** Keep system running even when parts fail.
+
+### Best Practice 4: Circuit Breaker
+
+For external dependencies (Kafka, DB):
+
+```java
+public class CircuitBreaker {
+    enum State { CLOSED, OPEN, HALF_OPEN }
+    private State state = State.CLOSED;
+    private int failureCount = 0;
+    private static final int FAILURE_THRESHOLD = 5;
+    
+    public void call(Runnable operation) throws Exception {
+        if (state == State.OPEN) {
+            throw new Exception("Circuit breaker is OPEN");
+        }
+        
+        try {
+            operation.run();
+            failureCount = 0;  // Reset on success
+        } catch (Exception e) {
+            failureCount++;
+            if (failureCount >= FAILURE_THRESHOLD) {
+                state = State.OPEN;  // Trip breaker
+                logger.error("Circuit breaker opened");
+            }
+            throw e;
+        }
+    }
+}
+```
+
+Prevents cascading failures.
+
+---
+
+## Part 16: Development Workflow
+
+### Local Testing Loop
+
+```bash
+# 1. Modify code
+vim src/main/java/com/daetl/cleaner/engine/DataCleaningEngine.java
+
+# 2. Compile
+mvn clean compile
+
+# 3. Run unit tests
+mvn test
+
+# 4. Package
+mvn package
+
+# 5. Start app
+java -jar target/data-cleaner-1.0.0.jar config.yaml &
+
+# 6. Generate test data
+java -cp target/data-cleaner-1.0.0.jar \
+  com.daetl.cleaner.test.SampleDataProducer localhost:9092 raw_data 1000
+
+# 7. Check results
+psql -U postgres -d data_cleaner -c "SELECT COUNT(*) FROM cleaned_records;"
+
+# 8. Stop app
+kill %1
+```
+
+### Debugging
+
+#### Print Statements
+
+```java
+System.out.println("DEBUG: Record hash = " + hash);
+logger.debug("Record {} -> {}", id, fields);
+```
+
+Enable debug logging:
+```java
+// src/main/resources/logback.xml
+<root level="DEBUG">
+    <appender-ref ref="CONSOLE" />
+</root>
+```
+
+#### Remote Debugging
+
+```bash
+# Start with debug port
+java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005 \
+  -jar target/data-cleaner-1.0.0.jar config.yaml
+
+# Connect IDE: Run → Debug Configurations → Remote → Connect to localhost:5005
+```
+
+#### Breakpoints in IDE
+
+IntelliJ IDEA / Eclipse: Set breakpoint, debug as above.
+
+---
+
+## Part 17: Quick Reference
+
+### Common Commands
+
+```bash
+# Build
+mvn clean package
+
+# Run app
+java -jar target/data-cleaner-1.0.0.jar config.yaml
+
+# Run with custom config
+java -jar target/data-cleaner-1.0.0.jar /path/to/config.yaml
+
+# Run with JVM options
+java -Xms2g -Xmx4g -XX:+UseG1GC \
+  -jar target/data-cleaner-1.0.0.jar config.yaml
+
+# Run GUI dashboard
+java -cp target/data-cleaner-1.0.0.jar \
+  --add-modules javafx.controls,javafx.fxml \
+  com.daetl.cleaner.gui.CleanerDashboard
+
+# Generate test data
+java -cp target/data-cleaner-1.0.0.jar \
+  com.daetl.cleaner.test.SampleDataProducer brokers topic count
+
+# Docker
+docker build -t data-cleaner:1.0 .
+docker-compose up -d
+docker-compose logs -f data-cleaner
+
+# Database
+psql -U postgres -d data_cleaner -c "SELECT COUNT(*) FROM cleaned_records;"
+```
+
+### Database Queries
+
+```sql
+-- Total stats
+SELECT COUNT(*) as total, 
+       SUM(CASE WHEN is_duplicate THEN 1 ELSE 0 END) as duplicates,
+       SUM(null_values_removed) as nulls_removed
+FROM cleaned_records;
+
+-- By status
+SELECT status, COUNT(*) 
+FROM cleaned_records 
+GROUP BY status;
+
+-- Recent records
+SELECT record_id, null_values_removed, is_duplicate, created_at 
+FROM cleaned_records 
+ORDER BY created_at DESC 
+LIMIT 10;
+
+-- Processing speed
+SELECT batch_number, 
+       records_processed, 
+       records_cleaned, 
+       processing_time_ms,
+       records_cleaned::float / processing_time_ms * 1000 as records_per_sec
+FROM cleaning_metrics 
+ORDER BY batch_number DESC 
+LIMIT 10;
+
+-- Average throughput
+SELECT AVG(records_cleaned::float / processing_time_ms * 1000) as avg_records_per_sec
+FROM cleaning_metrics;
+```
+
+### Configuration Presets
+
+#### Development (Local)
+```yaml
+kafka:
+  brokers: "localhost:9092"
+database:
+  url: "jdbc:postgresql://localhost:5432/data_cleaner"
+cleaning:
+  concurrent_workers: 4
+```
+
+#### Staging (Medium load)
+```yaml
+kafka:
+  brokers: "kafka-staging:9092"
+  batch_size: 2000
+database:
+  url: "jdbc:postgresql://postgres-staging:5432/data_cleaner"
+  pool_size: 30
+cleaning:
+  concurrent_workers: 8
+```
+
+#### Production (High throughput)
+```yaml
+kafka:
+  brokers: "kafka-prod-1:9092,kafka-prod-2:9092,kafka-prod-3:9092"
+  batch_size: 5000
+database:
+  url: "jdbc:postgresql://postgres-prod:5432/data_cleaner"
+  pool_size: 50
+cleaning:
+  concurrent_workers: 16
+tls:
+  enabled: true
+  keystore_path: "/etc/secrets/keystore.jks"
+```
+
+---
+
+## Conclusion
+
+You now have everything needed to:
+
+1. **Build** a complete data cleaning pipeline from scratch
+2. **Understand** every architectural decision
+3. **Test** locally with sample data
+4. **Optimize** for your workload
+5. **Deploy** to production safely
+6. **Monitor** and troubleshoot issues
+7. **Extend** with custom rules
+8. **Scale** horizontally and vertically
+
+### Key Skills You've Learned
+
+- **Concurrency**: Threads, locks, atomic types, thread-safe data structures
+- **Data Systems**: Streaming (Kafka), persistence (PostgreSQL), connection pooling
+- **Architecture**: Decoupled components, backpressure, graceful shutdown
+- **Performance**: Batching, indexing, profiling, optimization
+- **DevOps**: Docker, compose, Kubernetes, monitoring
+- **Production Readiness**: Error handling, health checks, configuration, logging
+
+### Next Challenges
+
+1. Build it for real data (10M+ records)
+2. Add custom cleaning rules for your domain
+3. Deploy to Kubernetes cluster
+4. Set up Prometheus + Grafana dashboards
+5. Implement Bloom filter for large dedup caches
+6. Add Spark distributed processing
+7. Create REST API for queries
+8. Contribute improvements back to community
+
+---
+
+Good luck building! 🚀
