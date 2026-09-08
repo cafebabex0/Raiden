@@ -7,7 +7,6 @@ For this project, you do **not** need to install Kafka or PostgreSQL directly on
 # Windows 11 Setup Guide
 
 ## What you will have at the end
-
 ```text
 Windows 11
 │
